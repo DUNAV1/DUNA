@@ -1,14 +1,14 @@
 # DUNA
 
-DUNA is an independent AI software-engineering workspace. This repository contains the first runnable MVP: a React workspace UI, a TypeScript API, an OpenAI-compatible chat adapter, project/task scaffolding, and explicit safety boundaries for future code execution.
+DUNA is an independent AI software-engineering workspace. The current MVP includes a React workspace UI, a TypeScript API, an OpenAI-compatible chat adapter, and a structured implementation-planning workflow.
 
-## Current MVP
-- Chat-based coding assistant with streamed responses.
+## Current capabilities
+- Chat-based coding assistant.
 - Local project/workspace creation in the browser session.
-- Task planning prompt and project context.
-- API health endpoint and provider configuration.
-- No host-shell execution. Code execution is intentionally disabled until an isolated runner is deployed.
-- No automatic Git pushes, deployments, or destructive file operations.
+- Structured implementation plans with ordered steps, likely file paths, validation ideas, risks, assumptions, and acceptance criteria.
+- Server-side schema validation for generated plans.
+- Safety checks that reject suggested paths involving secrets, credentials, private keys, `.git`, or dependency folders.
+- No host-shell execution, file writes, Git pushes, deployments, or destructive operations.
 
 ## Requirements
 - Node.js 20+
@@ -24,26 +24,21 @@ npm run dev
 Web: http://localhost:5173  
 API: http://localhost:8787/health
 
-Without an API key, the chat endpoint returns a clear configuration error. Never put API keys in frontend environment variables.
+Without an API key, chat and planning endpoints return a clear configuration error. Never put provider API keys in frontend environment variables.
 
-## Build
+## API endpoints
+- `GET /health` — API health check.
+- `POST /api/chat` — conversational assistant.
+- `POST /api/plan` — generates a structured plan. Request body: `{ "task": "...", "project": { "name": "...", "description": "..." } }`.
+
+The planning endpoint returns `controls` showing that execution is disabled, no files were changed, no commands were run, and human approval is required. Plans are suggestions, not repository inspection or verified implementation instructions.
+
+## Build and validate
 ```bash
 npm run typecheck
 npm run build
 npm start
 ```
-
-## GitLab: create the standalone repository
-Create an empty GitLab project named `duna` under your account/group, then:
-```bash
-git init
-git add .
-git commit -m "Initial DUNA MVP"
-git branch -M main
-git remote add origin https://gitlab.com/<YOUR_NAMESPACE>/duna.git
-git push -u origin main
-```
-This environment does not currently have an authorized GitLab repository-creation/push integration, so the source is prepared locally and the remote repository has not been created.
 
 ## Security architecture before enabling agents
 1. Run each task in a disposable, non-root container with CPU, memory, process, disk, and time limits.
@@ -55,10 +50,11 @@ This environment does not currently have an authorized GitLab repository-creatio
 7. Treat repository content and tool output as untrusted input, never as system instructions.
 
 ## Planned milestones
-- Persistent auth and workspace storage (Supabase).
-- GitLab/GitHub OAuth and repository import.
-- Sandboxed execution service and terminal streaming.
-- Patch/diff review, tests, branch/commit workflow.
+- Persistent auth and workspace storage.
+- GitHub OAuth and repository import.
+- Repository-aware file inspection and context selection.
+- Human-reviewed patch generation and diff approval.
+- Sandboxed execution service, terminal streaming, and test runs.
 - Multi-agent planner, implementer, tester, reviewer.
 - Build pipelines and explicitly approved deployment.
 
