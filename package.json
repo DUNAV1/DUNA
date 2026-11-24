@@ -2,14 +2,17 @@
   "name": "duna",
   "private": true,
   "version": "0.1.0",
-  "workspaces": ["apps/*"],
+  "workspaces": [
+    "apps/*"
+  ],
   "scripts": {
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:web\"",
     "dev:web": "npm --workspace @duna/web run dev",
     "dev:server": "npm --workspace @duna/server run dev",
     "build": "npm --workspace @duna/server run build && npm --workspace @duna/web run build",
     "typecheck": "npm --workspaces run typecheck",
-    "start": "npm --workspace @duna/server run start"
+    "start": "npm --workspace @duna/server run start",
+    "runner:build": "docker build -t duna-runner:local -f apps/runner/Dockerfile apps/runner"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",
