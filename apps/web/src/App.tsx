@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import {
   Bot,
@@ -21,7 +21,10 @@ import {
   Info,
   Loader2,
   Check,
-  X
+  X,
+  Play,
+  Activity,
+  RefreshCw
 } from "lucide-react";
 
 type Message = { role: "user" | "assistant"; content: string };
@@ -75,6 +78,31 @@ type PatchChange = {
   baseSha256: string;
 };
 type PatchProposal = { summary: string; changes: PatchChange[] };
+type RunnerProfile = "node-tests" | "javascript-syntax" | "typescript-syntax";
+type RunnerStatus = {
+  enabled: boolean;
+  dockerAvailable: boolean;
+  imageAvailable: boolean;
+  ready: boolean;
+  message?: string;
+};
+type RunnerJob = {
+  id: string;
+  profile: RunnerProfile;
+  state: "queued" | "preparing" | "running" | "succeeded" | "failed" | "timed_out" | "cancelled";
+  output: string;
+  exitCode: number | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+};
+
+const RUNNER_PROFILE_INFO: Record<RunnerProfile, { label: string; description: string }> = {
+  "node-tests": { label: "Node.js tests", description: "Run discovered *.test.js / *.spec.js files with Node's built-in test runner. No packages are installed." },
+  "javascript-syntax": { label: "JavaScript syntax", description: "Parse .js, .mjs and .cjs files without executing project code." },
+  "typescript-syntax": { label: "TypeScript / TSX syntax", description: "Parse .ts and .tsx files. This is not a semantic TypeScript typecheck." }
+};
 
 type WritableFileHandleLike = {
   kind: "file";
@@ -207,9 +235,53 @@ export default function App() {
   const [inspectionContext, setInspectionContext] = useState<InspectionContext | null>(null);
   const [patchProposal, setPatchProposal] = useState<PatchProposal | null>(null);
   const [writableFolderName, setWritableFolderName] = useState("");
+  const [runnerStatus, setRunnerStatus] = useState<RunnerStatus | null>(null);
+  const [runnerProfile, setRunnerProfile] = useState<RunnerProfile>("typescript-syntax");
+  const [runnerJob, setRunnerJob] = useState<RunnerJob | null>(null);
   const writableDirectoryRef = useRef<WritableDirectoryHandleLike | null>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const active = useMemo(() => projects.find((project) => project.id === activeId) ?? projects[0], [projects, activeId]);
+
+  useEffect(() => {
+    let mounted = true;
+    fetch("/api/runner/status")
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Unable to read sandbox status");
+        return response.json() as Promise<RunnerStatus>;
+      })
+      .then((status) => { if (mounted) setRunnerStatus(status); })
+      .catch(() => { if (mounted) setRunnerStatus({ enabled: false, dockerAvailable: false, imageAvailable: false, ready: false, message: "Sandbox status is unavailable." }); });
+    return () => { mounted = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!runnerJob || ["succeeded", "failed", "timed_out", "cancelled"].includes(runnerJob.state)) return;
+    const events = new EventSource(`/api/runner/jobs/${runnerJob.id}/events`);
+    events.addEventListener("snapshot", (event) => {
+      const next = JSON.parse((event as MessageEvent<string>).data) as RunnerJob;
+      setRunnerJob((previous) => previous?.id === next.id ? { ...previous, ...next } : previous);
+    });
+    events.addEventListener("log", (event) => {
+      const payload = JSON.parse((event as MessageEvent<string>).data) as { chunk: string };
+      setRunnerJob((previous) => previous?.id === runnerJob.id ? { ...previous, output: `${previous.output}${payload.chunk}`.slice(-90_000) } : previous);
+    });
+    events.addEventListener("status", (event) => {
+      const next = JSON.parse((event as MessageEvent<string>).data) as RunnerJob;
+      setRunnerJob((previous) => previous?.id === next.id ? { ...previous, ...next } : previous);
+    });
+    events.addEventListener("done", (event) => {
+      const next = JSON.parse((event as MessageEvent<string>).data) as RunnerJob;
+      setRunnerJob((previous) => previous?.id === next.id ? { ...previous, ...next } : previous);
+      events.close();
+    });
+    events.addEventListener("error", () => {
+      setRunnerJob((previous) => previous?.id === runnerJob.id && !["succeeded", "failed", "timed_out", "cancelled"].includes(previous.state)
+        ? { ...previous, output: `${previous.output}\nLost connection to the live log stream. Refresh the job to inspect its final status.\n` }
+        : previous);
+      events.close();
+    });
+    return () => events.close();
+  }, [runnerJob?.id]);
 
   function createProject() {
     const name = window.prompt("Project name");
@@ -223,6 +295,7 @@ export default function App() {
     setInspection(null);
     setInspectionContext(null);
     setPatchProposal(null);
+    setRunnerJob(null);
     writableDirectoryRef.current = null;
     setWritableFolderName("");
     setCodebaseName("");
@@ -238,6 +311,7 @@ export default function App() {
     setInspection(null);
     setInspectionContext(null);
     setPatchProposal(null);
+    setRunnerJob(null);
     setMessages([]);
     setPlan(null);
     try {
@@ -397,6 +471,63 @@ export default function App() {
       setMessages([]);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Unable to generate a reviewed patch");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelSandboxJob() {
+    if (!runnerJob || !["queued", "preparing", "running"].includes(runnerJob.state)) return;
+    try {
+      const response = await fetch(`/api/runner/jobs/${runnerJob.id}/cancel`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Unable to cancel sandbox job");
+      setNotice("Sandbox job cancellation requested. The disposable container will be removed.");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to cancel sandbox job");
+    }
+  }
+
+  async function refreshRunnerStatus() {
+    try {
+      const response = await fetch("/api/runner/status");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Unable to read sandbox status");
+      setRunnerStatus(data as RunnerStatus);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to read sandbox status");
+    }
+  }
+
+  async function startSandboxCheck() {
+    if (sourceFiles.length === 0 || busy) return;
+    if (!runnerStatus?.ready) {
+      setNotice(runnerStatus?.message ?? "The Docker sandbox is not ready. Check the runner setup instructions in README.md.");
+      return;
+    }
+    const profileInfo = RUNNER_PROFILE_INFO[runnerProfile];
+    const approved = window.confirm(
+      `Run ${profileInfo.label} in a disposable Docker sandbox?\n\n` +
+      `${profileInfo.description}\n\n` +
+      "The container has no network, no host-folder mounts, a read-only root filesystem, and resource limits. " +
+      "Only the selected source snapshot is copied into its temporary workspace. The sandbox is deleted afterwards."
+    );
+    if (!approved) return;
+
+    setBusy(true);
+    setNotice("");
+    setRunnerJob(null);
+    try {
+      const response = await fetch("/api/runner/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ profile: runnerProfile, files: sourceFiles })
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Unable to start the sandbox job");
+      setRunnerJob(data.job as RunnerJob);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Unable to start the sandbox job");
     } finally {
       setBusy(false);
     }
@@ -608,6 +739,39 @@ export default function App() {
                   {busy ? "Working…" : "Analyze project"}
                 </button>
               </div>
+              <div className="runner-control-card">
+                <div className="runner-control-copy">
+                  <div><Activity size={15} /> <b>Sandbox execution</b><span className={`runner-status-pill ${runnerStatus?.ready ? "ready" : "disabled"}`}>{runnerStatus?.ready ? "READY" : "DISABLED"}</span></div>
+                  <p>{runnerStatus?.ready
+                    ? "Run one fixed validation profile in a disposable, networkless container. No changes are written back to your project."
+                    : (runnerStatus?.message ?? "Checking local Docker runner…")}</p>
+                </div>
+                <div className="runner-control-actions">
+                  <select aria-label="Sandbox check profile" value={runnerProfile} onChange={(event) => setRunnerProfile(event.target.value as RunnerProfile)} disabled={busy}>
+                    {Object.entries(RUNNER_PROFILE_INFO).map(([value, item]) => <option key={value} value={value}>{item.label}</option>)}
+                  </select>
+                  <button className="run-sandbox-button" onClick={startSandboxCheck} disabled={busy || !runnerStatus?.ready}>
+                    {busy ? <Loader2 size={14} className="spin" /> : <Play size={14} />}
+                    Run approved check
+                  </button>
+                  <button className="runner-refresh-button" onClick={refreshRunnerStatus} disabled={busy} title="Refresh Docker runner status"><RefreshCw size={14} /></button>
+                </div>
+              </div>
+              {runnerJob && (
+                <div className="runner-job-card">
+                  <div className="runner-job-header">
+                    <div><Activity size={14} /> <b>{RUNNER_PROFILE_INFO[runnerJob.profile].label}</b></div>
+                    <span className={`runner-job-state state-${runnerJob.state}`}>{runnerJob.state.replace("_", " ")}</span>
+                  </div>
+                  <pre className="runner-job-output">{runnerJob.output || "Waiting for sandbox output…"}</pre>
+                  <div className="runner-job-footer">
+                    <span>Job {runnerJob.id.slice(0, 8)} · Exit code: {runnerJob.exitCode === null ? "—" : runnerJob.exitCode}</span>
+                    {runnerJob.state === "running" || runnerJob.state === "preparing" || runnerJob.state === "queued" ? (
+                      <span className="runner-footer-actions"><span className="runner-live"><i /> LIVE OUTPUT</span><button onClick={cancelSandboxJob}>Cancel job</button></span>
+                    ) : null}
+                  </div>
+                </div>
+              )}
               <details className="source-file-list">
                 <summary><FileCode2 size={13} /> View selected file list</summary>
                 <div>{sourceFiles.slice(0, 30).map((file) => <code key={file.path}>{file.path}</code>)}</div>
@@ -776,7 +940,7 @@ export default function App() {
               </div>
             </div>
           </div>
-          <div className="disclaimer">DUNA can make mistakes. Review plans and every code diff. File changes require your explicit approval.</div>
+          <div className="disclaimer">DUNA can make mistakes. Review every plan and code diff. Sandbox checks run only after approval in a disposable container; they do not modify your project.</div>
         </section>
       </main>
     </div>

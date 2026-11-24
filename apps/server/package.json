@@ -7,7 +7,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "tsx --test src/projectIntelligence.test.ts src/patchGenerator.test.ts"
+    "test": "tsx --test src/projectIntelligence.test.ts src/patchGenerator.test.ts src/runnerPolicy.test.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

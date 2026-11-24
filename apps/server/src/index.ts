@@ -9,6 +9,8 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { isAllowedProjectPath, prepareProjectFiles, PROJECT_FILE_LIMITS, redactSensitiveValues } from "./projectIntelligence.js";
 import { createPatchDiff, hasRedactionMarker, isPatchCandidateSafe, normalizePatchContent } from "./patchGenerator.js";
+import { cancelRunnerJob, checkDockerReadiness, createRunnerJob, getRunnerJob, publicJob, subscribeRunnerJob } from "./dockerRunner.js";
+import { isRunnerProfile, validateRunnerSnapshot, RUNNER_PROFILES } from "./runnerPolicy.js";
 
 // Load the repository-root .env regardless of whether npm starts this workspace
 // from apps/server, apps/server/src, or apps/server/dist. Existing process
@@ -19,10 +21,15 @@ dotenv.config();
 
 const app = express();
 const port = Number(process.env.PORT ?? 8787);
-const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:5173";
+const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:5173,http://127.0.0.1:5173";
 
 app.use(helmet());
-app.use(cors({ origin: webOrigin.split(",").map((s) => s.trim()), methods: ["GET", "POST"] }));
+const allowedWebOrigins = Array.from(new Set([
+  ...webOrigin.split(",").map((origin) => origin.trim()).filter(Boolean),
+  "http://localhost:5173",
+  "http://127.0.0.1:5173"
+]));
+app.use(cors({ origin: allowedWebOrigins, methods: ["GET", "POST"] }));
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "duna-api", version: "0.2.0" }));
@@ -70,6 +77,11 @@ const PatchProposalSchema = z.object({
     rationale: z.string().min(8).max(600),
     newContent: z.string().min(1).max(PROJECT_FILE_LIMITS.maxFileChars)
   })).max(3)
+});
+
+const RunnerJobRequestSchema = z.object({
+  profile: z.enum(["node-tests", "javascript-syntax", "typescript-syntax"]),
+  files: z.array(ProjectSourceFileSchema).min(1).max(PROJECT_FILE_LIMITS.maxFiles)
 });
 
 const ProjectInspectionSchema = z.object({
@@ -532,10 +544,90 @@ app.post("/api/project/patch", async (req, res) => {
   }
 });
 
-// Deliberately no shell/terminal endpoint in this MVP.
-// Execution must be implemented as a separate, isolated worker service.
+// Local-only, allowlisted sandbox execution. No arbitrary command strings are accepted.
+app.get("/api/runner/status", async (_req, res) => {
+  const enabled = process.env.DUNA_EXECUTION_ENABLED === "true";
+  const image = process.env.DUNA_RUNNER_IMAGE ?? "duna-runner:local";
+  if (!enabled) {
+    return res.json({
+      enabled: false,
+      dockerAvailable: false,
+      imageAvailable: false,
+      ready: false,
+      profiles: RUNNER_PROFILES,
+      message: "Sandbox execution is disabled. Set DUNA_EXECUTION_ENABLED=true after building the local DUNA runner image."
+    });
+  }
+  const readiness = await checkDockerReadiness(image);
+  return res.json({ enabled, ...readiness, ready: readiness.dockerAvailable && readiness.imageAvailable, profiles: RUNNER_PROFILES });
+});
+
+app.post("/api/runner/jobs", async (req, res) => {
+  if (process.env.DUNA_EXECUTION_ENABLED !== "true") {
+    return res.status(503).json({ error: "DUNA sandbox execution is disabled. Build the runner image and explicitly enable DUNA_EXECUTION_ENABLED=true in the server .env file." });
+  }
+  const parsed = RunnerJobRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid sandbox job request", details: parsed.error.flatten() });
+  }
+  if (!isRunnerProfile(parsed.data.profile)) return res.status(400).json({ error: "Unsupported runner profile." });
+
+  let files: ReturnType<typeof validateRunnerSnapshot>;
+  try {
+    files = validateRunnerSnapshot(parsed.data.files);
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : "Unsafe runner snapshot." });
+  }
+
+  const image = process.env.DUNA_RUNNER_IMAGE ?? "duna-runner:local";
+  const readiness = await checkDockerReadiness(image);
+  if (!readiness.dockerAvailable || !readiness.imageAvailable) {
+    return res.status(503).json({ error: readiness.message ?? "DUNA sandbox is not ready." });
+  }
+
+  try {
+    const job = createRunnerJob(parsed.data.profile, files);
+    return res.status(202).json({ job: publicJob(job), controls: { userApproved: true, networkEnabled: false, hostFoldersMounted: false, arbitraryCommandsAllowed: false, executionEnabled: true } });
+  } catch (error) {
+    return res.status(429).json({ error: error instanceof Error ? error.message : "Unable to queue sandbox job." });
+  }
+});
+
+app.get("/api/runner/jobs/:id", (req, res) => {
+  const job = getRunnerJob(req.params.id);
+  if (!job) return res.status(404).json({ error: "Sandbox job not found or expired." });
+  return res.json({ job });
+});
+
+app.post("/api/runner/jobs/:id/cancel", async (req, res) => {
+  const cancelled = await cancelRunnerJob(req.params.id);
+  if (!cancelled) return res.status(409).json({ error: "Sandbox job is not active or has expired." });
+  return res.json({ cancelled: true });
+});
+
+app.get("/api/runner/jobs/:id/events", (req, res) => {
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  const heartbeat = setInterval(() => res.write(": keep-alive\n\n"), 15_000);
+  const unsubscribe = subscribeRunnerJob(req.params.id, (event, payload) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+    if (event === "done") { clearInterval(heartbeat); res.end(); }
+  });
+  if (!unsubscribe) {
+    clearInterval(heartbeat);
+    res.write(`event: error\ndata: ${JSON.stringify({ error: "Sandbox job not found or expired." })}\n\n`);
+    res.end();
+    return;
+  }
+  req.on("close", () => { clearInterval(heartbeat); unsubscribe(); });
+});
+
+// Unknown API routes are rejected. Sandbox jobs are handled only by fixed profiles above.
 app.use((_req, res) => res.status(404).json({ error: "Not found" }));
 
-app.listen(port, () => {
-  console.log(`DUNA API listening on http://localhost:${port}`);
+app.listen(port, "127.0.0.1", () => {
+  console.log(`DUNA API listening on http://127.0.0.1:${port}`);
 });
